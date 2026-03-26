@@ -20,7 +20,7 @@ using MessageId = std::string;
 using ToolUseId = std::string;
 
 // ── Enums ───────────────────────────────────────────────────────────────────
-enum class ContentType : uint8_t { Text, ToolUse, ToolResult };
+enum class ContentType : uint8_t { Text, Thinking, ToolUse, ToolResult };
 enum class StopReason : uint8_t { EndTurn, ToolUse, MaxTokens, StopSequence };
 enum class Role : uint8_t { User, Assistant };
 

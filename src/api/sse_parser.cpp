@@ -80,6 +80,10 @@ auto SseParser::parse_payload(std::string_view type, std::string_view data)
                 return event::ContentBlockStart{
                     idx, ContentType::Text, {}, {}};
             }
+            if (cb_type == "thinking") {
+                return event::ContentBlockStart{
+                    idx, ContentType::Thinking, {}, {}};
+            }
             if (cb_type == "tool_use") {
                 return event::ContentBlockStart{
                     idx, ContentType::ToolUse,
@@ -95,6 +99,10 @@ auto SseParser::parse_payload(std::string_view type, std::string_view data)
 
             if (delta_type == "text_delta") {
                 return event::TextDelta{delta.value("text", "")};
+            }
+            if (delta_type == "thinking_delta") {
+                // Treat thinking text as regular text delta for display.
+                return event::TextDelta{delta.value("thinking", "")};
             }
             if (delta_type == "input_json_delta") {
                 return event::InputJsonDelta{delta.value("partial_json", "")};

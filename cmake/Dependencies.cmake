@@ -1,6 +1,7 @@
 include(FetchContent)
 
 find_package(CURL REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 # ── simdjson ─────────────────────────────────────────────────────────────────
 FetchContent_Declare(

@@ -4,6 +4,7 @@
 #include <clawed/core/error.hpp>
 #include <clawed/api/messages.hpp>
 #include <clawed/api/sse_parser.hpp>
+#include <clawed/auth/auth.hpp>
 #include <chrono>
 #include <string>
 
@@ -15,7 +16,7 @@ namespace clawed {
 class ApiClient {
 public:
     struct Config {
-        std::string api_key;
+        auth::Credentials credentials;
         std::string base_url    = "https://api.anthropic.com";
         std::string api_version = "2023-06-01";
         std::chrono::seconds timeout{300};
@@ -31,6 +32,7 @@ public:
 
     // Stream a messages request. Blocks until stream completes or errors.
     // Events are pushed to sink as they arrive.
+    // Automatically refreshes OAuth token if expired.
     auto stream_message(const api::CreateMessageRequest& request,
                         SseParser::EventSink& sink) -> Result<void>;
 
@@ -40,6 +42,7 @@ private:
 
     void init_curl();
     void cleanup_curl();
+    void ensure_fresh_token();
 
     // curl write callback — feeds chunks into the SSE parser.
     static auto write_cb(char* ptr, size_t size, size_t nmemb, void* userdata)

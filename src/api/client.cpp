@@ -1,6 +1,7 @@
 #include <clawed/api/client.hpp>
 #include <curl/curl.h>
 #include <format>
+#include <iostream>
 
 namespace clawed {
 
@@ -10,6 +11,7 @@ struct StreamContext {
     SseParser::EventSink sink;
     bool                 had_error = false;
     std::string          error_msg;
+    std::string          raw_body;  // for error diagnostics
 };
 
 // ── Construction / destruction ──────────────────────────────────────────────
@@ -57,6 +59,7 @@ auto ApiClient::write_cb(char* ptr, size_t size, size_t nmemb, void* userdata)
     auto* ctx  = static_cast<StreamContext*>(userdata);
 
     try {
+        ctx->raw_body.append(ptr, total);
         ctx->parser.feed(std::span<const char>(ptr, total), ctx->sink);
     } catch (const std::exception& ex) {
         ctx->had_error = true;
@@ -65,6 +68,21 @@ auto ApiClient::write_cb(char* ptr, size_t size, size_t nmemb, void* userdata)
     }
 
     return total;
+}
+
+// ── Token refresh ───────────────────────────────────────────────────────────
+
+void ApiClient::ensure_fresh_token() {
+    auto& creds = config_.credentials;
+    if (creds.method != auth::AuthMethod::OAuthToken) return;
+    if (!creds.is_expired()) return;
+    if (creds.refresh_token.empty()) return;
+
+    auto refreshed = auth::refresh_access_token(creds.refresh_token);
+    if (refreshed) {
+        config_.credentials = std::move(*refreshed);
+        auth::save_credentials(config_.credentials);
+    }
 }
 
 // ── Streaming request ───────────────────────────────────────────────────────
@@ -76,6 +94,9 @@ auto ApiClient::stream_message(const api::CreateMessageRequest& request,
         return make_error(ErrorCode::HttpConnectionFailed, "curl not initialized");
     }
 
+    // Refresh OAuth token if expired.
+    ensure_fresh_token();
+
     auto* handle = static_cast<::CURL*>(curl_);
 
     // Build URL.
@@ -83,14 +104,22 @@ auto ApiClient::stream_message(const api::CreateMessageRequest& request,
 
     // Build JSON body.
     auto body = request.to_json().dump();
+    std::cerr << "[debug] request body: " << body.substr(0, 1000) << "\n";
 
     // Build headers.
+    auto auth_header = std::format("{}: {}",
+        config_.credentials.header_name(),
+        config_.credentials.header_value());
+
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/json");
-    headers = curl_slist_append(headers,
-        std::format("x-api-key: {}", config_.api_key).c_str());
+    headers = curl_slist_append(headers, auth_header.c_str());
     headers = curl_slist_append(headers,
         std::format("anthropic-version: {}", config_.api_version).c_str());
+    // oauth-2025-04-20 is required when authenticating via OAuth Bearer token.
+    if (config_.credentials.method == auth::AuthMethod::OAuthToken) {
+        headers = curl_slist_append(headers, "anthropic-beta: oauth-2025-04-20");
+    }
     headers = curl_slist_append(headers, "Accept: text/event-stream");
 
     // Set up context.
@@ -108,16 +137,17 @@ auto ApiClient::stream_message(const api::CreateMessageRequest& request,
     curl_easy_setopt(handle, CURLOPT_WRITEDATA, &ctx);
     curl_easy_setopt(handle, CURLOPT_TIMEOUT,
         static_cast<long>(config_.timeout.count()));
-    // Disable signals for thread safety.
     curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1L);
 
     // Perform request.
     CURLcode res = curl_easy_perform(handle);
 
-    // Cleanup headers.
-    curl_slist_free_all(headers);
+    // Get HTTP status before reset.
+    long http_code = 0;
+    curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &http_code);
 
-    // Reset curl handle for reuse.
+    // Cleanup.
+    curl_slist_free_all(headers);
     curl_easy_reset(handle);
 
     if (res != CURLE_OK) {
@@ -131,12 +161,17 @@ auto ApiClient::stream_message(const api::CreateMessageRequest& request,
             std::format("curl error: {}", curl_easy_strerror(res)));
     }
 
-    // Check HTTP status.
-    long http_code = 0;
-    curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &http_code);
-    // Note: after curl_easy_reset, this won't work. Let's check before reset.
-    // Actually we need to restructure — move reset after getinfo.
-    // For now, errors are caught via SSE error events from the API.
+    if (http_code == 401) {
+        return make_error(ErrorCode::ApiAuthError,
+            "authentication failed (401). Run 'clawed login' to re-authenticate.");
+    }
+
+    if (http_code >= 400) {
+        // Include the response body for diagnostics (truncated).
+        auto body_preview = ctx.raw_body.substr(0, 500);
+        return make_error(ErrorCode::ApiError,
+            std::format("API error (HTTP {}): {}", http_code, body_preview));
+    }
 
     return {};
 }

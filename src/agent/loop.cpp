@@ -51,7 +51,8 @@ auto AgentLoop::step(UiSink& ui) -> Result<bool> {
         // Current tool call being assembled.
         std::string current_tool_id;
         std::string current_tool_name;
-        bool        in_tool_block = false;
+        bool        in_tool_block    = false;
+        bool        in_thinking_block = false;
 
         StopReason  stop_reason = StopReason::EndTurn;
 
@@ -70,11 +71,15 @@ auto AgentLoop::step(UiSink& ui) -> Result<bool> {
                     ss.current_tool_name = e.tool_name;
                     ss.in_tool_block     = true;
                     ss.tool_json_accum.clear();
+                } else if (e.type == ContentType::Thinking) {
+                    ss.in_thinking_block = true;
                 }
                 sm_.process(std::move(e), ui);
             },
             [&](event::TextDelta& e) {
-                ss.text_accum += e.text;
+                if (!ss.in_thinking_block) {
+                    ss.text_accum += e.text;
+                }
                 sm_.process(std::move(e), ui);
             },
             [&](event::InputJsonDelta& e) {
@@ -82,7 +87,9 @@ auto AgentLoop::step(UiSink& ui) -> Result<bool> {
                 sm_.process(std::move(e), ui);
             },
             [&](event::ContentBlockStop& e) {
-                if (ss.in_tool_block) {
+                if (ss.in_thinking_block) {
+                    ss.in_thinking_block = false;
+                } else if (ss.in_tool_block) {
                     ss.tool_calls.push_back({
                         .id         = ss.current_tool_id,
                         .name       = ss.current_tool_name,
