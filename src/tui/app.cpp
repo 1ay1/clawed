@@ -67,7 +67,8 @@ void App::run_interactive() {
 
         // ── Per-turn state ───────────────────────────────────────────────
         bool has_text = false;
-        int  round = 0;  // tool round counter
+        int  round = 0;
+        bool thinking_shown = false;
 
         struct Slot {
             std::string name;
@@ -77,6 +78,22 @@ void App::run_interactive() {
         };
         std::vector<Slot> slots;
         bool slots_printed = false;
+
+        // Show thinking indicator immediately
+        auto show_thinking = [&]() {
+            if (round == 0)
+                std::cout << GRAY << "  \xe2\x97\x8c thinking..." << RST << std::flush;
+            else
+                std::cout << GRAY << "  \xe2\x97\x8c thinking... "
+                          << DIM << "(round " << (round + 1) << ")" << RST << std::flush;
+            thinking_shown = true;
+        };
+        auto clear_thinking = [&]() {
+            if (thinking_shown) {
+                std::cout << "\r" << CCLR << std::flush;
+                thinking_shown = false;
+            }
+        };
 
         // Helper: print/reprint all slots from scratch
         auto print_slots = [&]() {
@@ -131,12 +148,14 @@ void App::run_interactive() {
 
                 // Streaming text — hot path, direct write
                 [&](UiTokens& t) {
+                    clear_thinking();
                     std::cout << t.text << std::flush;
                     has_text = true;
                 },
 
                 // Model declared a tool call (during streaming)
                 [&](UiToolQueued& t) {
+                    clear_thinking();
                     if (has_text) {
                         std::cout << "\n";
                         has_text = false;
@@ -175,11 +194,11 @@ void App::run_interactive() {
                 // Status: thinking between rounds
                 [&](UiStatus&) {
                     if (slots_printed) {
-                        // New round — clear slot state
                         ++round;
                         slots.clear();
                         slots_printed = false;
                     }
+                    show_thinking();
                 },
 
                 // Error
