@@ -100,7 +100,18 @@ inline auto CreateMessageRequest::to_json() const -> nlohmann::json {
     j["stream"]     = stream;
 
     if (!system_prompt.empty()) {
-        j["system"] = system_prompt;
+        // System prompt sent as array of text blocks.
+        // The billing attribution block enables Max/Pro subscription rate limits
+        // when using OAuth tokens (same mechanism as Claude Code).
+        j["system"] = nlohmann::json::array();
+        j["system"].push_back({
+            {"type", "text"},
+            {"text", "x-anthropic-billing-header: cc_version=0.1.0; cc_entrypoint=cli; cch=00000;"}
+        });
+        j["system"].push_back({
+            {"type", "text"},
+            {"text", system_prompt}
+        });
     }
 
     j["messages"] = nlohmann::json::array();

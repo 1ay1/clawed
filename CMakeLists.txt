@@ -19,9 +19,7 @@ add_executable(clawed
     src/agent/loop.cpp
     src/agent/conversation.cpp
     src/tui/app.cpp
-    src/tui/stream_view.cpp
-    src/tui/input_view.cpp
-    src/tui/tool_view.cpp
+    src/tui/terminal.cpp
     src/ssh/session.cpp
     src/executor/local.cpp
     src/executor/ssh.cpp
@@ -32,9 +30,6 @@ target_link_libraries(clawed PRIVATE
     CURL::libcurl
     OpenSSL::Crypto
     nlohmann_json::nlohmann_json
-    ftxui::screen
-    ftxui::dom
-    ftxui::component
 )
 
 target_compile_options(clawed PRIVATE

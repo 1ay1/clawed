@@ -4,6 +4,7 @@
 #include <clawed/api/sse_parser.hpp>
 #include <clawed/auth/auth.hpp>
 #include <clawed/core/error.hpp>
+#include <nlohmann/json.hpp>
 #include <chrono>
 #include <format>
 #include <span>
@@ -130,15 +131,35 @@ auto ApiClient::stream_message(const api::CreateMessageRequest& request, Sink& s
             std::format("curl error: {}", curl_easy_strerror(res)));
     }
 
-    if (http_code == 401) {
-        return make_error(ErrorCode::ApiAuthError,
-            "authentication failed (401). Run 'clawed login' to re-authenticate.");
-    }
-
     if (http_code >= 400) {
-        return make_error(ErrorCode::ApiError,
-            std::format("API error (HTTP {}): {}",
-                http_code, ctx.raw_body.substr(0, 500)));
+        // Try to extract a human-readable message from the JSON error body
+        std::string friendly_msg;
+        try {
+            auto j = nlohmann::json::parse(ctx.raw_body);
+            if (j.contains("error") && j["error"].contains("message"))
+                friendly_msg = j["error"]["message"].template get<std::string>();
+        } catch (...) {}
+
+        if (http_code == 401) {
+            return make_error(ErrorCode::ApiAuthError,
+                "Authentication failed. Run 'clawed login' to re-authenticate.");
+        }
+        if (http_code == 429) {
+            auto msg = friendly_msg.empty()
+                ? "Rate limited — too many requests. Wait a moment and try again."
+                : "Rate limited — " + friendly_msg;
+            return make_error(ErrorCode::ApiRateLimit, std::move(msg));
+        }
+        if (http_code == 529) {
+            return make_error(ErrorCode::ApiOverloaded,
+                "The API is temporarily overloaded. Try again in a few seconds.");
+        }
+
+        // Generic error with friendly message if available
+        auto msg = friendly_msg.empty()
+            ? std::format("API error (HTTP {})", http_code)
+            : std::format("API error — {}", friendly_msg);
+        return make_error(ErrorCode::ApiError, std::move(msg));
     }
 
     return {};

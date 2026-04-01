@@ -1,17 +1,18 @@
 #include <clawed/tui/app.hpp>
+#include <clawed/tui/terminal.hpp>
+#include <clawed/tui/md_renderer.hpp>
+#include <clawed/tui/components.hpp>
 
-#include <ftxui/component/component.hpp>
-#include <ftxui/component/screen_interactive.hpp>
-#include <ftxui/component/event.hpp>
-#include <ftxui/dom/elements.hpp>
-
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <mutex>
+#include <sstream>
 #include <thread>
 
 namespace clawed::tui {
-
-using namespace ftxui;
 
 App::App(ApiClient& client, ToolRegistry& registry, AgentLoop::Config agent_config)
     : client_(client)
@@ -21,326 +22,349 @@ App::App(ApiClient& client, ToolRegistry& registry, AgentLoop::Config agent_conf
 
 void App::run() { run_interactive(); }
 
-// ── Conversation model ──────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared state — protected by mu. Both agent thread and UI thread take the
+// lock, but only briefly. Tokens write DIRECTLY to terminal under lock —
+// no buffering, no polling delay.
+// ─────────────────────────────────────────────────────────────────────────────
 
 namespace {
 
-struct ToolCard {
-    std::string name, id, summary, detail, result;
-    enum State { Queued, Running, Done, Failed } state = Queued;
-    int duration_ms = 0;
-};
-
-struct ConvBlock {
-    enum Kind { User, Assistant, Thinking } kind;
-    std::string text;
-    std::vector<ToolCard> tools;
-};
-
-struct AppState {
+struct State {
     std::mutex mu;
-    std::vector<ConvBlock> blocks;
-    std::string streaming;
-    bool is_streaming = false;
+
     std::string status = "idle";
-    std::vector<ToolCard> current_tools; // tools for current round
-    bool dirty = false;
+    std::chrono::steady_clock::time_point thinking_since;
+    std::chrono::steady_clock::time_point turn_started;  // for total turn timing
+
+    std::vector<ToolCardProps> live_tools;
+
+    int overlay_lines = 0;
+    int turn_count = 0;
+    int api_round = 0;
+    int tools_used = 0;          // total tools this turn (across rounds)
+    bool had_streaming = false;
+    bool done = false;
+    std::string error_msg;
 };
 
-// ── Render helpers ───────────────────────────────────────────────────────
-
-auto render_tool(const ToolCard& t) -> Element {
-    std::string icon;
-    ftxui::Color icon_color;
-    switch (t.state) {
-        case ToolCard::Queued:  icon = "○"; icon_color = Color::GrayDark; break;
-        case ToolCard::Running: icon = "●"; icon_color = Color::Yellow; break;
-        case ToolCard::Done:    icon = "✓"; icon_color = Color::Green; break;
-        case ToolCard::Failed:  icon = "✗"; icon_color = Color::Red; break;
+auto make_preview(const std::string& name, const std::string& result) -> std::string {
+    if (result.empty() || name == "write_file") return {};
+    std::istringstream iss(result);
+    std::string line, preview;
+    int n = 0;
+    while (std::getline(iss, line) && n < 3) {
+        if (line.empty()) continue;
+        if (line.size() > 90) line = line.substr(0, 90) + "...";
+        if (!preview.empty()) preview += "\n";
+        preview += line;
+        n++;
     }
-
-    auto label = t.summary.empty() ? t.name : t.name + " " + t.summary;
-    if (label.size() > 70) label = label.substr(0, 70) + "...";
-
-    Elements line_parts;
-    line_parts.push_back(text("  " + icon + " ") | color(icon_color));
-    line_parts.push_back(text(t.name + " ") | color(Color::White));
-
-    if (!t.summary.empty() && t.summary != t.name) {
-        auto s = t.summary;
-        if (s.size() > 60) s = s.substr(0, 60) + "...";
-        line_parts.push_back(text(s + " ") | color(Color::GrayLight));
-    }
-
-    if (t.duration_ms > 0) {
-        std::string dur = t.duration_ms < 1000
-            ? std::format("{}ms", t.duration_ms)
-            : std::format("{:.1f}s", t.duration_ms / 1000.0);
-        line_parts.push_back(text(dur) | color(Color::GrayDark));
-    }
-
-    Elements result;
-    result.push_back(hbox(std::move(line_parts)));
-
-    // Show detail (diff for edit, command for bash)
-    if (!t.detail.empty() && (t.state == ToolCard::Running || t.state == ToolCard::Done || t.state == ToolCard::Failed)) {
-        // Parse diff lines
-        Elements detail_lines;
-        std::istringstream iss(t.detail);
-        std::string dl;
-        int line_count = 0;
-        while (std::getline(iss, dl) && line_count < 8) {
-            if (dl.starts_with("- "))
-                detail_lines.push_back(text("    " + dl) | color(Color::Red));
-            else if (dl.starts_with("+ "))
-                detail_lines.push_back(text("    " + dl) | color(Color::Green));
-            else
-                detail_lines.push_back(text("    " + dl) | color(Color::GrayLight));
-            ++line_count;
-        }
-        if (!detail_lines.empty()) {
-            result.push_back(vbox(std::move(detail_lines)));
-        }
-    }
-
-    // Show error result inline
-    if (t.state == ToolCard::Failed && !t.result.empty()) {
-        auto msg = t.result;
-        if (msg.size() > 80) msg = msg.substr(0, 80) + "...";
-        result.push_back(text("    " + msg) | color(Color::Red));
-    }
-
-    return vbox(std::move(result));
+    int remaining = 0;
+    while (std::getline(iss, line)) remaining++;
+    if (remaining > 0)
+        preview += std::format("\n... +{} more lines", remaining);
+    return preview;
 }
 
-auto render_block(const ConvBlock& block) -> Element {
-    Elements parts;
-
-    switch (block.kind) {
-        case ConvBlock::User:
-            parts.push_back(hbox({
-                text(" > ") | color(Color::Magenta) | bold,
-                paragraph(block.text) | color(Color::White),
-            }));
-            break;
-
-        case ConvBlock::Thinking:
-            parts.push_back(text("  ◌ " + block.text) | color(Color::GrayDark));
-            break;
-
-        case ConvBlock::Assistant:
-            if (!block.text.empty())
-                parts.push_back(paragraph(block.text));
-            break;
+void clear_overlay(State& s, Terminal& term) {
+    if (s.overlay_lines <= 0) return;
+    for (int i = 0; i < s.overlay_lines; ++i) {
+        term.clear_line();
+        term.move_up();
     }
-
-    for (auto& tool : block.tools)
-        parts.push_back(render_tool(tool));
-
-    parts.push_back(text(""));
-    return vbox(std::move(parts));
+    term.clear_line();
+    s.overlay_lines = 0;
 }
 
 } // anonymous namespace
 
-void App::run_interactive() {
-    auto screen = ScreenInteractive::Fullscreen();
+// ─────────────────────────────────────────────────────────────────────────────
 
-    AppState state;
+void App::run_interactive() {
+    Terminal term;
+    term.enable_raw();
+
+    MdRenderer md;
+
+    State state;
+    std::string model;
+    if (auto* m = std::getenv("CLAWED_MODEL")) model = m;
+    else model = "claude-opus-4-6";
+
     std::string input_text;
     std::jthread agent_thread;
+    bool running = true;
 
-    // ── UI Sink (called from agent thread) ───────────────────────────────
+    // Detect cwd and git branch for header
+    auto cwd = std::filesystem::current_path().string();
+    std::string git_branch;
+    {
+        // Fast git branch detection — read .git/HEAD directly
+        auto git_head = std::filesystem::current_path() / ".git" / "HEAD";
+        if (std::filesystem::exists(git_head)) {
+            std::ifstream f(git_head);
+            std::string line;
+            if (std::getline(f, line)) {
+                constexpr auto prefix = std::string_view("ref: refs/heads/");
+                if (line.starts_with(prefix))
+                    git_branch = line.substr(prefix.size());
+                else if (line.size() >= 8)
+                    git_branch = line.substr(0, 8); // detached HEAD
+            }
+        }
+    }
+
+    // Header
+    HeaderView{model, cwd, git_branch}.render(term);
+    PromptView{input_text, true}.render(term);
+    term.flush();
+
+    // ── Tool render tracking ────────────────────────────────────────────────
+    struct ToolRS { bool running_done = false; bool completion_done = false; };
+    std::vector<ToolRS> tool_rs;
+
+    // ── UI Sink ─────────────────────────────────────────────────────────────
+    // Called from agent thread. Tokens write DIRECTLY to terminal under lock.
+    // No buffer. No delay. Instant.
     auto ui_sink = [&](UiEvent evt) {
         std::visit(Overloaded{
             [&](UiTokens& t) {
+                // HOT PATH — write directly to terminal, zero latency
                 std::lock_guard lock(state.mu);
-                state.streaming += t.text;
-                state.is_streaming = true;
-                state.dirty = true;
+                clear_overlay(state, term);
+
+                if (!state.had_streaming) {
+                    // First text — check if tools preceded
+                    bool had_tools = false;
+                    for (auto& tl : state.live_tools)
+                        if (tl.status != ToolStatus::Queued) { had_tools = true; break; }
+                    md.set_had_tools(had_tools);
+                    state.had_streaming = true;
+                }
+
+                md.feed(t.text, term);
             },
             [&](UiToolQueued& t) {
                 std::lock_guard lock(state.mu);
-                state.current_tools.push_back({
-                    .name = t.name, .id = t.id, .summary = {}, .detail = {},
-                    .result = {}, .state = ToolCard::Queued});
-                state.dirty = true;
+                state.live_tools.push_back({
+                    .name = t.name, .id = t.id,
+                    .summary = {}, .detail = {},
+                    .error_msg = {}, .result_preview = {},
+                    .duration_ms = 0, .status = ToolStatus::Queued});
             },
             [&](UiToolRunning& t) {
                 std::lock_guard lock(state.mu);
-                for (auto& tool : state.current_tools) {
+                for (auto& tool : state.live_tools)
                     if (tool.id == t.id) {
-                        tool.state = ToolCard::Running;
+                        tool.status = ToolStatus::Running;
                         tool.summary = t.summary;
                         tool.detail = t.detail;
                         break;
                     }
-                }
                 state.status = t.name;
-                state.dirty = true;
+                state.thinking_since = std::chrono::steady_clock::now();
             },
             [&](UiToolEnd& t) {
                 std::lock_guard lock(state.mu);
-                for (auto& tool : state.current_tools) {
+                for (auto& tool : state.live_tools)
                     if (tool.id == t.id) {
-                        tool.state = t.is_error ? ToolCard::Failed : ToolCard::Done;
+                        tool.status = t.is_error ? ToolStatus::Failed : ToolStatus::Done;
                         tool.duration_ms = t.duration_ms;
-                        tool.result = t.result;
+                        if (t.is_error)
+                            tool.error_msg = t.result;
+                        else
+                            tool.result_preview = make_preview(tool.name, t.result);
                         break;
                     }
-                }
-                state.dirty = true;
+                state.tools_used++;
             },
             [&](UiStatus&) {
                 std::lock_guard lock(state.mu);
-                // Flush current tools + streaming into a block
-                if (!state.current_tools.empty() || !state.streaming.empty()) {
-                    ConvBlock blk{ConvBlock::Assistant, std::move(state.streaming),
-                                  std::move(state.current_tools)};
-                    state.blocks.push_back(std::move(blk));
-                    state.streaming.clear();
-                    state.current_tools.clear();
-                }
+                state.live_tools.clear();
+                state.had_streaming = false;
                 state.status = "thinking";
-                state.dirty = true;
+                state.thinking_since = std::chrono::steady_clock::now();
+                state.api_round++;
+                md.reset();
             },
             [&](UiError& e) {
                 std::lock_guard lock(state.mu);
-                ConvBlock blk{ConvBlock::Assistant, "error: " + e.error.message, {}};
-                state.blocks.push_back(std::move(blk));
+                state.error_msg = e.error.message;
                 state.status = "error";
-                state.dirty = true;
+                state.done = true;
             },
             [&](UiDone&) {
                 std::lock_guard lock(state.mu);
-                // Flush remaining
-                ConvBlock blk{ConvBlock::Assistant, std::move(state.streaming),
-                              std::move(state.current_tools)};
-                if (!blk.text.empty() || !blk.tools.empty())
-                    state.blocks.push_back(std::move(blk));
-                state.streaming.clear();
-                state.current_tools.clear();
-                state.is_streaming = false;
                 state.status = "idle";
-                state.dirty = true;
+                state.done = true;
+                state.turn_count++;
             },
         }, evt);
-        screen.PostEvent(Event::Custom);
     };
 
-    // ── Submit handler ───────────────────────────────────────────────────
+    // ── Submit ──────────────────────────────────────────────────────────────
     auto do_submit = [&]() {
         if (input_text.empty()) return;
         auto msg = input_text;
         input_text.clear();
 
+        UserMessageView{msg}.render(term);
+        term.flush();
+
         {
             std::lock_guard lock(state.mu);
-            state.blocks.push_back({ConvBlock::User, msg, {}});
             state.status = "thinking";
+            state.thinking_since = std::chrono::steady_clock::now();
+            state.turn_started = state.thinking_since;
+            state.live_tools.clear();
+            state.had_streaming = false;
+            state.done = false;
+            state.error_msg.clear();
+            state.api_round = 0;
+            state.tools_used = 0;
+            state.overlay_lines = 0;
         }
+
+        md.reset();
+        tool_rs.clear();
 
         if (agent_thread.joinable()) agent_thread.join();
 
-        agent_thread = std::jthread([&, msg = std::move(msg), sink = ui_sink]() {
+        agent_thread = std::jthread([&, msg, sink = ui_sink]() {
             auto result = agent_.run_turn(msg, sink);
             if (!result) sink(UiError{result.error()});
         });
     };
 
-    // ── FTXUI Component ──────────────────────────────────────────────────
-    auto component = Renderer([&] {
-        std::lock_guard lock(state.mu);
-
-        // ── Conversation ─────────────────────────────────────────────
-        Elements conv_items;
-        for (auto& block : state.blocks)
-            conv_items.push_back(render_block(block));
-
-        // Live streaming + current tools
-        if (state.is_streaming || !state.current_tools.empty()) {
-            Elements live;
-            for (auto& t : state.current_tools)
-                live.push_back(render_tool(t));
-            if (!state.streaming.empty())
-                live.push_back(paragraph(state.streaming));
-            conv_items.push_back(vbox(std::move(live)));
+    // ── Main loop ───────────────────────────────────────────────────────────
+    // Only handles: input, tool card rendering, spinner, completion.
+    // Token streaming is handled directly in ui_sink above.
+    while (running) {
+        auto evt = term.poll_input();
+        bool idle;
+        {
+            std::lock_guard lock(state.mu);
+            idle = (state.status == "idle" || state.status == "error");
         }
 
-        // Status indicator (thinking)
-        if (state.status == "thinking" && !state.is_streaming && state.current_tools.empty()) {
-            conv_items.push_back(text("  ◌ thinking...") | color(Color::GrayDark));
+        switch (evt.type) {
+            case InputType::CtrlC:
+                running = false;
+                continue;
+            case InputType::Enter:
+                if (idle) {
+                    clear_overlay(state, term);
+                    do_submit();
+                }
+                break;
+            case InputType::Backspace:
+                if (idle && !input_text.empty()) {
+                    input_text.pop_back();
+                    PromptView{input_text, true}.render(term);
+                    term.flush();
+                }
+                break;
+            case InputType::CtrlU:
+                if (idle) {
+                    input_text.clear();
+                    PromptView{input_text, true}.render(term);
+                    term.flush();
+                }
+                break;
+            case InputType::Char:
+                if (idle) {
+                    input_text += evt.ch;
+                    PromptView{input_text, true}.render(term);
+                    term.flush();
+                }
+                break;
+            default:
+                break;
         }
 
-        auto conversation = vbox(std::move(conv_items)) |
-            vscroll_indicator | focusPositionRelative(0, 1) | frame | flex;
+        // ── Tool rendering + spinner + completion ───────────────────────────
+        {
+            std::lock_guard lock(state.mu);
 
-        // ── Input ────────────────────────────────────────────────────
-        auto input_line = hbox({
-            text(" > ") | color(Color::Magenta) | bold,
-            text(input_text.empty() ? " " : input_text),
-            text("█") | color(Color::White) | blink,
-        });
+            while (tool_rs.size() < state.live_tools.size())
+                tool_rs.push_back({});
 
-        // ── Status bar ───────────────────────────────────────────────
-        auto status_color = state.status == "idle" ? Color::Green
-                          : state.status == "error" ? Color::Red
-                          : Color::Yellow;
-        auto status_bar = hbox({
-            text(" clawed ") | color(Color::Cyan) | bold,
-            filler(),
-            text(" " + state.status + " ") | color(status_color),
-        }) | inverted;
+            for (size_t i = 0; i < state.live_tools.size(); ++i) {
+                auto& t = state.live_tools[i];
+                auto& rs = tool_rs[i];
 
-        // ── Layout ───────────────────────────────────────────────────
-        return vbox({
-            conversation,
-            separator() | color(Color::GrayDark),
-            input_line,
-            status_bar,
-        });
-    });
-
-    // ── Event handling ───────────────────────────────────────────────────
-    component = CatchEvent(component, [&](Event event) -> bool {
-        // Ctrl+Q / Ctrl+C quit
-        if (event.input() == std::string(1, 17) ||  // Ctrl+Q
-            event.input() == std::string(1, 3)) {   // Ctrl+C
-            if (agent_thread.joinable()) {
-                agent_.request_stop();
-                agent_thread.join();
+                if (t.status == ToolStatus::Running && !rs.running_done) {
+                    clear_overlay(state, term);
+                    // Flush any partial text before tool output
+                    if (md.has_partial()) { md.flush(term); term.writeln(); }
+                    ToolCardView{t}.render(term);
+                    rs.running_done = true;
+                }
+                if ((t.status == ToolStatus::Done || t.status == ToolStatus::Failed)
+                    && !rs.completion_done) {
+                    clear_overlay(state, term);
+                    if (md.has_partial()) { md.flush(term); term.writeln(); }
+                    ToolCardView{t}.render(term);
+                    rs.running_done = true;
+                    rs.completion_done = true;
+                }
             }
-            screen.Exit();
-            return true;
+
+            // Completion
+            if (state.done) {
+                clear_overlay(state, term);
+                md.flush(term);
+                if (state.had_streaming) term.writeln();
+
+                if (!state.error_msg.empty())
+                    ErrorView{state.error_msg}.render(term);
+
+                // Timing summary
+                auto turn_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - state.turn_started).count();
+                TimingView{
+                    .elapsed_ms = turn_ms,
+                    .tools_used = state.tools_used,
+                    .api_rounds = state.api_round
+                }.render(term);
+
+                term.writeln();
+
+                state.done = false;
+                state.live_tools.clear();
+                state.had_streaming = false;
+                tool_rs.clear();
+                md.reset();
+
+                PromptView{input_text, true}.render(term);
+                continue;
+            }
+
+            // Spinner — only when no partial line on screen
+            if (!idle && !md.has_partial()) {
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - state.thinking_since).count();
+
+                clear_overlay(state, term);
+                SpinnerView{.elapsed_ms = ms}.render(term);
+                state.overlay_lines = 1;
+            }
+
+            term.flush();
         }
 
-        // Enter → submit
-        if (event == Event::Return) {
-            do_submit();
-            return true;
-        }
-
-        // Typing
-        if (event.is_character()) {
-            input_text += event.character();
-            return true;
-        }
-
-        // Backspace
-        if (event == Event::Backspace && !input_text.empty()) {
-            input_text.pop_back();
-            return true;
-        }
-
-        return false;
-    });
-
-    screen.Loop(component);
+        auto sleep_ms = idle ? 50 : 16;
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+    }
 
     if (agent_thread.joinable()) {
         agent_.request_stop();
         agent_thread.join();
     }
+
+    term.writeln();
+    term.disable_raw();
 }
 
 } // namespace clawed::tui
