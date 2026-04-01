@@ -1,16 +1,11 @@
 #pragma once
 
-#include <clawed/ide/terminal.hpp>
-#include <clawed/ide/screen.hpp>
-#include <clawed/ide/widgets/code_view.hpp>
-#include <clawed/ide/widgets/file_tree.hpp>
-#include <clawed/ide/widgets/agent_chat.hpp>
-#include <clawed/ide/widgets/status_bar.hpp>
 #include <clawed/agent/loop.hpp>
 #include <clawed/api/client.hpp>
 #include <clawed/tool/registry.hpp>
 
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -24,28 +19,42 @@ public:
     void run();
 
 private:
-    Terminal terminal_;
-    Screen screen_;
-    AgentLoop agent_;
+    ApiClient&    client_;
+    ToolRegistry& registry_;
+    AgentLoop     agent_;
 
-    widgets::FileTree   file_tree_;
-    widgets::CodeView   code_view_;
-    widgets::AgentChat  agent_chat_;
-    widgets::StatusBar  status_bar_;
+    // ── Shared state (agent thread → UI thread) ─────────────────────────
+    struct SharedState {
+        mutable std::mutex mu;
 
-    enum Panel { PanelFileTree, PanelCode, PanelChat };
-    Panel focused_ = PanelChat;
-    bool  running_ = true;
+        // Chat
+        std::vector<std::string> chat_lines;
+        std::string streaming_text;
+        bool is_streaming = false;
 
-    // Agent thread + event queue
-    std::mutex queue_mu_;
-    std::vector<UiEvent> pending_;
+        // Tools
+        struct ToolInfo {
+            std::string name, id, summary;
+            enum { Queued, Running, Done, Failed } state = Queued;
+            int duration_ms = 0;
+        };
+        std::vector<ToolInfo> tools;
+
+        // Status
+        std::string agent_status = "idle";
+
+        // Code view
+        std::string current_file;
+        std::vector<std::string> file_lines;
+
+        // Dirty flag
+        bool dirty = false;
+    };
+
+    SharedState state_;
     std::jthread agent_thread_;
 
-    void handle_event(const InputEvent& ev);
-    void process_agent_updates();
-    void layout_and_render();
-    void submit_to_agent(std::string message);
+    void submit_message(const std::string& msg);
     auto build_ui_sink() -> UiSink;
 };
 

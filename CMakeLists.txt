@@ -25,14 +25,7 @@ add_executable(clawed
     src/ssh/session.cpp
     src/executor/local.cpp
     src/executor/ssh.cpp
-    src/ide/terminal.cpp
-    src/ide/screen.cpp
-    src/ide/layout.cpp
     src/ide/ide_app.cpp
-    src/ide/widgets/status_bar.cpp
-    src/ide/widgets/code_view.cpp
-    src/ide/widgets/file_tree.cpp
-    src/ide/widgets/agent_chat.cpp
 )
 
 target_include_directories(clawed PRIVATE include)
@@ -40,6 +33,9 @@ target_link_libraries(clawed PRIVATE
     CURL::libcurl
     OpenSSL::Crypto
     nlohmann_json::nlohmann_json
+    ftxui::screen
+    ftxui::dom
+    ftxui::component
 )
 
 target_compile_options(clawed PRIVATE
