@@ -16,10 +16,6 @@ add_executable(clawed
     src/api/client.cpp
     src/api/sse_parser.cpp
     src/tool/registry.cpp
-    src/tool/builtin/bash.cpp
-    src/tool/builtin/read_file.cpp
-    src/tool/builtin/write_file.cpp
-    src/tool/builtin/glob.cpp
     src/agent/loop.cpp
     src/agent/conversation.cpp
     src/tui/app.cpp

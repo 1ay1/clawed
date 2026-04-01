@@ -116,8 +116,8 @@ int launch(const clawed::auth::Credentials& creds,
            std::string system_prompt) {
     clawed::ApiClient client({.credentials = creds});
 
-    clawed::ToolRegistry registry;
-    clawed::tools::register_all(registry, std::move(executor));
+    clawed::ToolRegistry registry(std::move(executor));
+    clawed::tools::register_all(registry);
 
     clawed::AgentLoop::Config agent_config{
         .model         = get_model(),
