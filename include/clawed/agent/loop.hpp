@@ -14,7 +14,7 @@ namespace clawed {
 class AgentLoop {
 public:
     struct Config {
-        std::string model = "claude-sonnet-4-20250514";
+        std::string model = "claude-haiku-4-5-20251001";
         std::string system_prompt;
     };
 

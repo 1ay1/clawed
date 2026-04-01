@@ -1,8 +1,6 @@
 #include <clawed/agent/loop.hpp>
 #include <nlohmann/json.hpp>
 #include <format>
-#include <thread>
-#include <future>
 
 namespace clawed {
 
@@ -18,6 +16,7 @@ AgentLoop::AgentLoop(ApiClient& client, ToolRegistry& registry, Config config)
 
 auto AgentLoop::run_turn(std::string user_message, UiSink ui_sink) -> Result<void> {
     stop_requested_.store(false);
+    sm_.reset();
     conversation_.add_user_message(std::move(user_message));
     sm_.process(event::UserMessage{""}, ui_sink);
 
@@ -48,11 +47,12 @@ auto AgentLoop::step(UiSink& ui) -> Result<bool> {
         std::string         tool_json_accum;
         std::vector<api::ContentBlock> content_blocks;
 
-        // Current tool call being assembled.
+        // Current block tracking.
         std::string current_tool_id;
         std::string current_tool_name;
-        bool        in_tool_block    = false;
+        bool        in_tool_block     = false;
         bool        in_thinking_block = false;
+        bool        in_text_block     = false;
 
         StopReason  stop_reason = StopReason::EndTurn;
 
@@ -60,7 +60,7 @@ auto AgentLoop::step(UiSink& ui) -> Result<bool> {
         std::vector<state::ToolExec::PendingCall> tool_calls;
     } ss;
 
-    SseParser::EventSink sink = [&](event::Event evt) {
+    auto sink = [&](event::Event evt) {
         std::visit(Overloaded{
             [&](event::ApiResponseStarted& e) {
                 sm_.process(std::move(e), ui);
@@ -73,6 +73,9 @@ auto AgentLoop::step(UiSink& ui) -> Result<bool> {
                     ss.tool_json_accum.clear();
                 } else if (e.type == ContentType::Thinking) {
                     ss.in_thinking_block = true;
+                } else if (e.type == ContentType::Text) {
+                    ss.in_text_block = true;
+                    ss.text_accum.clear();
                 }
                 sm_.process(std::move(e), ui);
             },
@@ -96,7 +99,6 @@ auto AgentLoop::step(UiSink& ui) -> Result<bool> {
                         .input_json = ss.tool_json_accum
                     });
 
-                    // Add to content blocks for conversation history.
                     nlohmann::json tool_input;
                     try {
                         tool_input = nlohmann::json::parse(ss.tool_json_accum);
@@ -108,16 +110,26 @@ auto AgentLoop::step(UiSink& ui) -> Result<bool> {
 
                     ss.in_tool_block = false;
                     ss.tool_json_accum.clear();
+                } else if (ss.in_text_block) {
+                    // Flush text block at its natural position (before tool_use blocks).
+                    if (!ss.text_accum.empty()) {
+                        ss.content_blocks.emplace_back(
+                            api::TextContent{ss.text_accum});
+                    }
+                    ss.in_text_block = false;
                 }
                 sm_.process(std::move(e), ui);
             },
             [&](event::MessageComplete& e) {
                 ss.stop_reason = e.reason;
-                // Add accumulated text as content block.
-                if (!ss.text_accum.empty()) {
+                // Flush remaining text only if still in a text block
+                // (i.e., ContentBlockStop hasn't flushed it yet).
+                if (ss.in_text_block && !ss.text_accum.empty()) {
                     ss.content_blocks.emplace_back(
                         api::TextContent{ss.text_accum});
                 }
+                ss.text_accum.clear();
+                ss.in_text_block = false;
                 sm_.process(std::move(e), ui);
             },
             [&](event::ErrorOccurred& e) {
@@ -129,24 +141,31 @@ auto AgentLoop::step(UiSink& ui) -> Result<bool> {
         }, evt);
     };
 
-    // Make the API call (blocks until stream completes).
     auto result = client_.stream_message(request, sink);
     if (!result) {
         return std::unexpected(result.error());
     }
 
     // Record assistant response in conversation.
-    if (!ss.content_blocks.empty()) {
-        conversation_.add_assistant_response(std::move(ss.content_blocks));
-    }
+    // Always add, even if empty — keeps user/assistant message alternation valid.
+    conversation_.add_assistant_response(std::move(ss.content_blocks));
 
     // If the model wants tool use, execute tools and feed results back.
-    if (ss.stop_reason == StopReason::ToolUse && !ss.tool_calls.empty()) {
-        state::ToolExec exec_state{.calls = std::move(ss.tool_calls)};
-        auto exec_result = execute_tools(exec_state, ui);
-        if (!exec_result) {
-            return std::unexpected(exec_result.error());
+    if (ss.stop_reason == StopReason::ToolUse) {
+        if (ss.tool_calls.empty()) {
+            // Edge case: stop_reason=ToolUse but no tool_calls collected.
+            // Add empty tool results so the conversation stays valid.
+            conversation_.add_tool_results({});
+        } else {
+            state::ToolExec exec_state{.calls = std::move(ss.tool_calls)};
+            auto exec_result = execute_tools(exec_state, ui);
+            if (!exec_result) {
+                return std::unexpected(exec_result.error());
+            }
         }
+        // Reset SM to Idle so the next step starts clean.
+        sm_.reset();
+        sm_.process(event::UserMessage{""}, ui);
         return true; // Need another API round-trip.
     }
 

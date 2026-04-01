@@ -21,9 +21,10 @@ enum class ErrorCode : uint16_t {
     ApiError            = 204,
 
     // Tool 3xx
-    ToolNotFound    = 300,
-    ToolExecFailed  = 301,
-    ToolTimeout     = 302,
+    ToolNotFound         = 300,
+    ToolExecFailed       = 301,
+    ToolTimeout          = 302,
+    SshConnectionFailed  = 303,
 
     // Internal 4xx
     InvalidState   = 400,

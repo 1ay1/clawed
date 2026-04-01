@@ -13,7 +13,6 @@ include(cmake/Dependencies.cmake)
 add_executable(clawed
     src/main.cpp
     src/auth/auth.cpp
-    src/core/state_machine.cpp
     src/api/client.cpp
     src/api/sse_parser.cpp
     src/tool/registry.cpp
@@ -27,17 +26,16 @@ add_executable(clawed
     src/tui/stream_view.cpp
     src/tui/input_view.cpp
     src/tui/tool_view.cpp
+    src/ssh/session.cpp
+    src/executor/local.cpp
+    src/executor/ssh.cpp
 )
 
 target_include_directories(clawed PRIVATE include)
 target_link_libraries(clawed PRIVATE
     CURL::libcurl
     OpenSSL::Crypto
-    simdjson
     nlohmann_json::nlohmann_json
-    ftxui::screen
-    ftxui::dom
-    ftxui::component
 )
 
 target_compile_options(clawed PRIVATE

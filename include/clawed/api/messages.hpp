@@ -53,7 +53,7 @@ struct ToolDefinition {
 // ── Request ─────────────────────────────────────────────────────────────────
 
 struct CreateMessageRequest {
-    std::string                  model       = "claude-sonnet-4-20250514";
+    std::string                  model       = "claude-haiku-4-5-20251001";
     std::vector<Message>         messages;
     std::string                  system_prompt;
     uint32_t                     max_tokens  = 16384;
@@ -75,7 +75,8 @@ inline void to_json(nlohmann::json& j, const ToolUseContent& c) {
 
 inline void to_json(nlohmann::json& j, const ToolResultContent& c) {
     j = {{"type", "tool_result"}, {"tool_use_id", c.tool_use_id},
-         {"content", c.content}, {"is_error", c.is_error}};
+         {"content", c.content}};
+    if (c.is_error) j["is_error"] = true;
 }
 
 inline void to_json(nlohmann::json& j, const ContentBlock& block) {
