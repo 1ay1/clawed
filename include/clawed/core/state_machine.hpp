@@ -12,15 +12,16 @@ namespace clawed {
 
 // ── UI event types ───────────────────────────────────────────────────────────
 
-struct UiTokens    { std::string text; };
-struct UiToolStart { std::string name; std::string id; };
-struct UiToolEnd   { std::string id; std::string result; bool is_error; };
-struct UiStatus    { std::string message; };
-struct UiError     { Error error; };
-struct UiDone      {};
+struct UiTokens      { std::string text; };
+struct UiToolQueued  { std::string name; std::string id; };
+struct UiToolRunning { std::string name; std::string id; std::string summary; };
+struct UiToolEnd     { std::string id; std::string result; bool is_error; int duration_ms; };
+struct UiStatus      { std::string message; };
+struct UiError       { Error error; };
+struct UiDone        {};
 
-using UiEvent = std::variant<UiTokens, UiToolStart, UiToolEnd,
-                             UiStatus, UiError, UiDone>;
+using UiEvent = std::variant<UiTokens, UiToolQueued, UiToolRunning,
+                             UiToolEnd, UiStatus, UiError, UiDone>;
 
 // Type-erased sink for module boundaries (app → agent loop).
 using UiSink = std::function<void(UiEvent)>;
@@ -100,7 +101,7 @@ auto StateMachine::process(event::Event evt, Sink& ui) -> Result<void>
             if (e.type == ContentType::ToolUse) {
                 s.pending_tool_ids.push_back(e.tool_use_id);
                 s.tool_json_accum.clear();
-                ui(UiToolStart{std::move(e.tool_name), std::move(e.tool_use_id)});
+                ui(UiToolQueued{std::move(e.tool_name), std::move(e.tool_use_id)});
             }
             return std::move(s);
         },
@@ -119,7 +120,7 @@ auto StateMachine::process(event::Event evt, Sink& ui) -> Result<void>
 
         // ToolExec + ToolResultReady → ToolExec | Thinking
         [&](state::ToolExec& s, event::ToolResultReady e) -> Result<state::State> {
-            ui(UiToolEnd{e.id, e.output, e.is_error});
+            ui(UiToolEnd{e.id, e.output, e.is_error, 0});
             if (++s.completed >= s.calls.size()) {
                 ui(UiStatus{"Thinking..."});
                 return state::Thinking{};

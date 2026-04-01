@@ -1,5 +1,6 @@
 #include <clawed/agent/loop.hpp>
 #include <nlohmann/json.hpp>
+#include <chrono>
 #include <format>
 
 namespace clawed {
@@ -172,6 +173,35 @@ auto AgentLoop::step(UiSink& ui) -> Result<bool> {
     return false; // Done.
 }
 
+namespace {
+
+/// Summarize tool input for display — shows what the tool is actually doing.
+auto summarize_input(const std::string& name, const nlohmann::json& input) -> std::string {
+    auto truncate = [](const std::string& s, size_t max = 60) -> std::string {
+        if (s.size() <= max) return s;
+        return s.substr(0, max) + "...";
+    };
+
+    if (name == "bash" && input.contains("command"))
+        return truncate(input["command"].get<std::string>(), 80);
+    if (name == "read_file" && input.contains("file_path"))
+        return input["file_path"].get<std::string>();
+    if (name == "write_file" && input.contains("file_path"))
+        return input["file_path"].get<std::string>();
+    if (name == "glob" && input.contains("pattern"))
+        return input["pattern"].get<std::string>();
+    if (name == "grep" && input.contains("pattern")) {
+        auto s = input["pattern"].get<std::string>();
+        if (input.contains("path")) s += " in " + input["path"].get<std::string>();
+        return truncate(s);
+    }
+    if (name == "edit" && input.contains("file_path"))
+        return input["file_path"].get<std::string>();
+    return {};
+}
+
+} // anonymous namespace
+
 auto AgentLoop::execute_tools(state::ToolExec& exec_state, UiSink& ui)
     -> Result<void>
 {
@@ -182,21 +212,29 @@ auto AgentLoop::execute_tools(state::ToolExec& exec_state, UiSink& ui)
         try {
             input = nlohmann::json::parse(call.input_json);
         } catch (const nlohmann::json::exception& ex) {
-            results.emplace_back(call.id,
-                std::format("JSON parse error: {}", ex.what()), true);
-            ui(UiToolEnd{call.id,
-                std::format("JSON parse error: {}", ex.what()), true});
+            auto msg = std::format("JSON parse error: {}", ex.what());
+            results.emplace_back(call.id, msg, true);
+            ui(UiToolEnd{call.id, msg, true, 0});
             continue;
         }
 
+        // Tell the UI what we're about to do
+        auto summary = summarize_input(call.name, input);
+        ui(UiToolRunning{call.name, call.id, summary});
+
+        // Execute with timing
+        auto t0 = std::chrono::steady_clock::now();
         auto tool_result = registry_.execute(call.name, input);
+        auto t1 = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+
         if (tool_result) {
             results.emplace_back(call.id, *tool_result, false);
-            ui(UiToolEnd{call.id, *tool_result, false});
+            ui(UiToolEnd{call.id, *tool_result, false, static_cast<int>(ms)});
         } else {
-            auto err_msg = tool_result.error().formatted();
+            auto err_msg = tool_result.error().message;
             results.emplace_back(call.id, err_msg, true);
-            ui(UiToolEnd{call.id, err_msg, true});
+            ui(UiToolEnd{call.id, err_msg, true, static_cast<int>(ms)});
         }
     }
 

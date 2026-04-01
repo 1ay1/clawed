@@ -1,6 +1,5 @@
 #include <clawed/tui/app.hpp>
 #include <clawed/tui/input_view.hpp>
-#include <clawed/tui/renderer.hpp>
 
 #include <iostream>
 #include <format>
@@ -17,33 +16,33 @@ void App::run() { run_interactive(); }
 
 namespace {
 
-// ── ANSI helpers (raw, fast, no allocation for constants) ────────────────────
+// ── Raw ANSI (no allocation, maximum speed) ──────────────────────────────────
 
-constexpr auto RST  = "\033[0m";
-constexpr auto BOLD = "\033[1m";
-constexpr auto DIM  = "\033[2m";
-constexpr auto ITAL = "\033[3m";
+constexpr auto RST   = "\033[0m";
+constexpr auto BOLD  = "\033[1m";
+constexpr auto DIM   = "\033[2m";
 
-constexpr auto FG_RED     = "\033[31m";
-constexpr auto FG_GREEN   = "\033[32m";
-constexpr auto FG_YELLOW  = "\033[33m";
-constexpr auto FG_BLUE    = "\033[34m";
-constexpr auto FG_MAGENTA = "\033[35m";
-constexpr auto FG_CYAN    = "\033[1;36m";
-constexpr auto FG_GRAY    = "\033[90m";
+constexpr auto RED   = "\033[31m";
+constexpr auto GREEN = "\033[32m";
+constexpr auto YELL  = "\033[33m";
+constexpr auto BLUE  = "\033[34m";
+constexpr auto MAG   = "\033[35m";
+constexpr auto CYAN  = "\033[1;36m";
+constexpr auto GRAY  = "\033[90m";
 
-constexpr auto CURSOR_UP    = "\033[A";
-constexpr auto CLEAR_LINE   = "\033[2K\r";
+constexpr auto CUP   = "\033[A";      // cursor up
+constexpr auto CCLR  = "\033[2K\r";   // clear line
 
-auto compact_error(const std::string& msg) -> std::string {
-    std::string s;
-    int lines = 0;
-    for (size_t i = 0; i < msg.size() && s.size() < 120; ++i) {
-        if (msg[i] == '\n' && ++lines >= 2) break;
-        s += msg[i];
-    }
-    while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
-    return s;
+/// Format duration in human-readable form.
+auto fmt_dur(int ms) -> std::string {
+    if (ms < 1000) return std::format("{}ms", ms);
+    return std::format("{:.1f}s", ms / 1000.0);
+}
+
+/// Truncate string to max length.
+auto trunc(const std::string& s, size_t max = 50) -> std::string {
+    if (s.size() <= max) return s;
+    return s.substr(0, max) + "...";
 }
 
 } // anonymous namespace
@@ -53,111 +52,144 @@ void App::run_interactive() {
 
     // ── Banner ───────────────────────────────────────────────────────────
     std::cout << "\n"
-              << FG_CYAN << "  clawed" << RST << FG_GRAY << " v0.1.0" << RST << "\n"
-              << FG_GRAY << "  C++ Claude agent runtime" << RST << "\n\n"
+              << CYAN << "  clawed" << RST << GRAY << " v0.1.0" << RST << "\n"
+              << GRAY << "  type a message, 'quit' to exit" << RST << "\n\n"
               << std::flush;
 
     while (true) {
         auto line = input.read_line(
-            std::format("{}{}>{} ", BOLD, FG_MAGENTA, RST));
+            std::format("{}{}>{} ", BOLD, MAG, RST));
 
         if (line.empty() || line == "quit" || line == "exit") {
-            std::cout << "\n" << FG_GRAY << "  Bye." << RST << "\n\n" << std::flush;
+            std::cout << "\n" << GRAY << "  bye" << RST << "\n\n" << std::flush;
             break;
         }
 
+        // ── Per-turn state ───────────────────────────────────────────────
         bool has_text = false;
-        int  step_num = 0;
+        int  round = 0;  // tool round counter
 
-        // Tool tracking for in-place updates
-        struct ToolSlot { std::string name; std::string id; bool printed = false; };
-        std::vector<ToolSlot> slots;
+        struct Slot {
+            std::string name;
+            std::string id;
+            std::string summary;
+            enum { Queued, Running, Done, Failed } state = Queued;
+        };
+        std::vector<Slot> slots;
         bool slots_printed = false;
 
+        // Helper: print/reprint all slots from scratch
+        auto print_slots = [&]() {
+            if (!slots_printed) {
+                std::cout << "\n";
+                slots_printed = true;
+            }
+            // Move up to first slot line
+            for (size_t i = 0; i < slots.size(); ++i)
+                std::cout << CUP;
+
+            for (auto& s : slots) {
+                std::cout << CCLR;
+                auto sid = s.id.size() > 8 ? s.id.substr(0, 8) : s.id;
+                auto label = trunc(s.summary.empty() ? s.name : s.summary);
+
+                switch (s.state) {
+                case Slot::Queued:
+                    std::cout << GRAY << "  " << DIM << "\xe2\x97\x8b" << RST  // ○
+                              << GRAY << " " << s.name << RST;
+                    break;
+                case Slot::Running:
+                    std::cout << YELL << "  \xe2\x97\x8f" << RST               // ●
+                              << " " << GRAY << s.name << RST
+                              << DIM << " " << label << RST;
+                    break;
+                case Slot::Done:
+                    std::cout << GREEN << "  \xe2\x9c\x93" << RST              // ✓
+                              << " " << GRAY << s.name << RST
+                              << DIM << " " << label << RST;
+                    break;
+                case Slot::Failed:
+                    std::cout << RED << "  \xe2\x9c\x97" << RST                // ✗
+                              << " " << RED << s.name << RST
+                              << DIM << " " << label << RST;
+                    break;
+                }
+                std::cout << "\n";
+            }
+            std::cout << std::flush;
+        };
+
+        auto find_slot = [&](const std::string& id) -> Slot* {
+            for (auto& s : slots)
+                if (s.id == id) return &s;
+            return nullptr;
+        };
+
+        // ── UI sink ──────────────────────────────────────────────────────
         UiSink ui_sink = [&](UiEvent evt) {
             std::visit(Overloaded{
 
-                // ── Streaming tokens (hot path) ──────────────────────────
+                // Streaming text — hot path, direct write
                 [&](UiTokens& t) {
                     std::cout << t.text << std::flush;
                     has_text = true;
                 },
 
-                // ── Tool queued (during streaming) ───────────────────────
-                [&](UiToolStart& t) {
+                // Model declared a tool call (during streaming)
+                [&](UiToolQueued& t) {
                     if (has_text) {
                         std::cout << "\n";
                         has_text = false;
                     }
-                    slots.push_back({t.name, t.id});
+                    slots.push_back({t.name, t.id, {}, Slot::Queued});
                 },
 
-                // ── Tool completed ───────────────────────────────────────
+                // Tool is about to execute — shows WHAT it's doing
+                [&](UiToolRunning& t) {
+                    if (auto* s = find_slot(t.id)) {
+                        s->state = Slot::Running;
+                        s->summary = t.summary;
+                    }
+                    print_slots();
+                },
+
+                // Tool completed — shows result + timing
                 [&](UiToolEnd& t) {
-                    // First result: print all queued tools with spinner placeholders
-                    if (!slots_printed) {
-                        slots_printed = true;
-                        std::cout << "\n";
-                        for (auto& s : slots) {
-                            auto sid = s.id.size() > 8 ? s.id.substr(0, 8) : s.id;
-                            std::cout << FG_GRAY << "  " << DIM << "\xe2\x97\x8b" << RST
-                                      << FG_GRAY << " " << s.name
-                                      << " " << DIM << sid << RST << "\n";
+                    if (auto* s = find_slot(t.id)) {
+                        s->state = t.is_error ? Slot::Failed : Slot::Done;
+                        if (!s->summary.empty()) {
+                            s->summary += std::format(" {}{}{}", DIM, fmt_dur(t.duration_ms), RST);
+                        } else {
+                            s->summary = fmt_dur(t.duration_ms);
                         }
-                        std::cout << std::flush;
+                        if (t.is_error) {
+                            // Append compact error
+                            auto msg = t.result;
+                            if (msg.size() > 60) msg = msg.substr(0, 60) + "...";
+                            s->summary += std::format(" {}{}{}", RED, msg, RST);
+                        }
                     }
-
-                    // Find the slot index
-                    int idx = -1;
-                    for (int i = 0; i < static_cast<int>(slots.size()); ++i)
-                        if (slots[i].id == t.id) { idx = i; break; }
-
-                    if (idx < 0) return;
-
-                    // Move cursor to the tool's line and rewrite it
-                    int up = static_cast<int>(slots.size()) - idx;
-                    for (int i = 0; i < up; ++i) std::cout << CURSOR_UP;
-                    std::cout << CLEAR_LINE;
-
-                    auto sid = t.id.size() > 8 ? t.id.substr(0, 8) : t.id;
-                    if (t.is_error) {
-                        auto msg = compact_error(t.result);
-                        std::cout << FG_RED << "  \xe2\x9c\x97 " << slots[idx].name
-                                  << " " << DIM << sid << RST
-                                  << FG_RED << " " << msg << RST;
-                    } else {
-                        std::cout << FG_GREEN << "  \xe2\x9c\x93 " << RST
-                                  << FG_GRAY << slots[idx].name
-                                  << " " << DIM << sid << RST;
-                    }
-
-                    // Move cursor back down
-                    std::cout << "\n";
-                    for (int i = 1; i < up; ++i) std::cout << "\033[B";
-                    std::cout << std::flush;
+                    print_slots();
                 },
 
-                // ── Status ───────────────────────────────────────────────
+                // Status: thinking between rounds
                 [&](UiStatus&) {
-                    if (step_num == 0 && !has_text) {
-                        // Only show on first step, before any output
-                    }
-                    // Reset tool state for next round
                     if (slots_printed) {
+                        // New round — clear slot state
+                        ++round;
                         slots.clear();
                         slots_printed = false;
-                        ++step_num;
                     }
                 },
 
-                // ── Error ────────────────────────────────────────────────
+                // Error
                 [&](UiError& e) {
-                    std::cout << "\n" << FG_RED << BOLD
-                              << "  Error: " << RST << FG_RED
+                    std::cout << "\n" << RED << BOLD
+                              << "  error: " << RST << RED
                               << e.error.message << RST << "\n" << std::flush;
                 },
 
-                // ── Done ─────────────────────────────────────────────────
+                // Turn complete
                 [&](UiDone&) {
                     if (has_text) std::cout << "\n";
                     std::cout << "\n" << std::flush;
@@ -168,8 +200,8 @@ void App::run_interactive() {
 
         auto result = agent_.run_turn(line, std::move(ui_sink));
         if (!result) {
-            std::cout << "\n" << FG_RED << BOLD << "  Error: " << RST
-                      << FG_RED << result.error().message << RST << "\n" << std::flush;
+            std::cout << "\n" << RED << BOLD << "  error: " << RST
+                      << RED << result.error().message << RST << "\n\n" << std::flush;
         }
     }
 }
