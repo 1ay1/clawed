@@ -1,7 +1,6 @@
 #include <clawed/tui/app.hpp>
 #include <clawed/tui/input_view.hpp>
 #include <clawed/tui/renderer.hpp>
-#include <clawed/tui/components.hpp>
 
 #include <iostream>
 #include <format>
@@ -14,172 +13,164 @@ App::App(ApiClient& client, ToolRegistry& registry, AgentLoop::Config agent_conf
     , agent_(client_, registry_, std::move(agent_config))
 {}
 
-void App::run() {
-    run_interactive();
-}
+void App::run() { run_interactive(); }
 
 namespace {
 
-/// Summarize tool input for compact display.
-auto summarize_tool(const std::string& name, const std::string& id) -> std::string {
-    auto short_id = id.size() > 8 ? id.substr(0, 8) : id;
-    return std::format("{} [{}]", name, short_id);
-}
+// ── ANSI helpers (raw, fast, no allocation for constants) ────────────────────
 
-/// Compact result: first 3 lines, max 200 chars.
-auto compact_result(const std::string& result, bool is_error) -> std::string {
-    if (result.empty()) return is_error ? "error" : "done";
+constexpr auto RST  = "\033[0m";
+constexpr auto BOLD = "\033[1m";
+constexpr auto DIM  = "\033[2m";
+constexpr auto ITAL = "\033[3m";
 
-    std::string compact;
+constexpr auto FG_RED     = "\033[31m";
+constexpr auto FG_GREEN   = "\033[32m";
+constexpr auto FG_YELLOW  = "\033[33m";
+constexpr auto FG_BLUE    = "\033[34m";
+constexpr auto FG_MAGENTA = "\033[35m";
+constexpr auto FG_CYAN    = "\033[1;36m";
+constexpr auto FG_GRAY    = "\033[90m";
+
+constexpr auto CURSOR_UP    = "\033[A";
+constexpr auto CLEAR_LINE   = "\033[2K\r";
+
+auto compact_error(const std::string& msg) -> std::string {
+    std::string s;
     int lines = 0;
-    for (size_t i = 0; i < result.size() && lines < 3 && compact.size() < 200; ++i) {
-        if (result[i] == '\n') {
-            ++lines;
-            if (lines >= 3) break;
-        }
-        compact += result[i];
+    for (size_t i = 0; i < msg.size() && s.size() < 120; ++i) {
+        if (msg[i] == '\n' && ++lines >= 2) break;
+        s += msg[i];
     }
-
-    // Trim trailing whitespace
-    while (!compact.empty() && (compact.back() == '\n' || compact.back() == ' '))
-        compact.pop_back();
-
-    if (compact.size() < result.size())
-        compact += " ...";
-
-    return compact;
+    while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
+    return s;
 }
 
 } // anonymous namespace
 
 void App::run_interactive() {
     InputView input;
-    Renderer renderer;
 
-    // Clean banner
-    renderer.stream_styled("clawed", styles::heading);
-    renderer.stream_styled(" v0.1.0\n", styles::muted);
-    renderer.flush();
+    // ── Banner ───────────────────────────────────────────────────────────
+    std::cout << "\n"
+              << FG_CYAN << "  clawed" << RST << FG_GRAY << " v0.1.0" << RST << "\n"
+              << FG_GRAY << "  C++ Claude agent runtime" << RST << "\n\n"
+              << std::flush;
 
     while (true) {
-        auto line = input.read_line("\033[1;32m> \033[0m");
+        auto line = input.read_line(
+            std::format("{}{}>{} ", BOLD, FG_MAGENTA, RST));
 
         if (line.empty() || line == "quit" || line == "exit") {
-            renderer.newline();
+            std::cout << "\n" << FG_GRAY << "  Bye." << RST << "\n\n" << std::flush;
             break;
         }
 
-        renderer.reset();
-        bool has_streamed_text = false;
-        int  tool_count = 0;
+        bool has_text = false;
+        int  step_num = 0;
 
-        // Track tool IDs in order so we can pair start/end
-        struct PendingTool { std::string name; std::string id; };
-        std::vector<PendingTool> pending_tools;
-        bool all_starts_done = false;
+        // Tool tracking for in-place updates
+        struct ToolSlot { std::string name; std::string id; bool printed = false; };
+        std::vector<ToolSlot> slots;
+        bool slots_printed = false;
 
         UiSink ui_sink = [&](UiEvent evt) {
             std::visit(Overloaded{
+
+                // ── Streaming tokens (hot path) ──────────────────────────
                 [&](UiTokens& t) {
-                    renderer.stream_token(t.text);
-                    renderer.flush();
-                    has_streamed_text = true;
+                    std::cout << t.text << std::flush;
+                    has_text = true;
                 },
 
+                // ── Tool queued (during streaming) ───────────────────────
                 [&](UiToolStart& t) {
-                    ++tool_count;
-                    if (has_streamed_text) {
-                        renderer.newline();
-                        has_streamed_text = false;
+                    if (has_text) {
+                        std::cout << "\n";
+                        has_text = false;
                     }
-                    pending_tools.push_back({t.name, t.id});
-                    // Don't print yet — wait until all starts are collected
-                    // (they all fire during streaming before any tool executes)
+                    slots.push_back({t.name, t.id});
                 },
 
+                // ── Tool completed ───────────────────────────────────────
                 [&](UiToolEnd& t) {
-                    // On first ToolEnd, print all pending tool lines
-                    if (!all_starts_done) {
-                        all_starts_done = true;
-                        for (auto& pt : pending_tools) {
-                            renderer.stream_styled(
-                                std::format("  {} ", summarize_tool(pt.name, pt.id)),
-                                styles::muted);
-                            renderer.newline();
+                    // First result: print all queued tools with spinner placeholders
+                    if (!slots_printed) {
+                        slots_printed = true;
+                        std::cout << "\n";
+                        for (auto& s : slots) {
+                            auto sid = s.id.size() > 8 ? s.id.substr(0, 8) : s.id;
+                            std::cout << FG_GRAY << "  " << DIM << "\xe2\x97\x8b" << RST
+                                      << FG_GRAY << " " << s.name
+                                      << " " << DIM << sid << RST << "\n";
                         }
+                        std::cout << std::flush;
                     }
 
-                    // Find and update the matching tool
-                    auto short_id = t.id.size() > 8 ? t.id.substr(0, 8) : t.id;
-
-                    // Move cursor up to the right line and overwrite
-                    // Find index of this tool
+                    // Find the slot index
                     int idx = -1;
-                    for (int i = 0; i < static_cast<int>(pending_tools.size()); ++i) {
-                        if (pending_tools[i].id == t.id) { idx = i; break; }
+                    for (int i = 0; i < static_cast<int>(slots.size()); ++i)
+                        if (slots[i].id == t.id) { idx = i; break; }
+
+                    if (idx < 0) return;
+
+                    // Move cursor to the tool's line and rewrite it
+                    int up = static_cast<int>(slots.size()) - idx;
+                    for (int i = 0; i < up; ++i) std::cout << CURSOR_UP;
+                    std::cout << CLEAR_LINE;
+
+                    auto sid = t.id.size() > 8 ? t.id.substr(0, 8) : t.id;
+                    if (t.is_error) {
+                        auto msg = compact_error(t.result);
+                        std::cout << FG_RED << "  \xe2\x9c\x97 " << slots[idx].name
+                                  << " " << DIM << sid << RST
+                                  << FG_RED << " " << msg << RST;
+                    } else {
+                        std::cout << FG_GREEN << "  \xe2\x9c\x93 " << RST
+                                  << FG_GRAY << slots[idx].name
+                                  << " " << DIM << sid << RST;
                     }
 
-                    if (idx >= 0) {
-                        // Move up to the tool's line
-                        int lines_up = static_cast<int>(pending_tools.size()) - idx;
-                        if (lines_up > 0) {
-                            renderer.write_raw(std::format("\033[{}A\r\033[2K", lines_up));
-                        }
+                    // Move cursor back down
+                    std::cout << "\n";
+                    for (int i = 1; i < up; ++i) std::cout << "\033[B";
+                    std::cout << std::flush;
+                },
 
-                        // Rewrite the line with result
-                        auto label = summarize_tool(pending_tools[idx].name, short_id);
-                        if (t.is_error) {
-                            auto msg = compact_result(t.result, true);
-                            renderer.stream_styled(std::format("  {} ", label), styles::muted);
-                            renderer.stream_styled(msg, styles::error);
-                        } else {
-                            renderer.stream_styled(std::format("  {} ", label), styles::muted);
-                            renderer.stream_styled("done", {Style{}.with_fg(Color::Green)});
-                        }
-
-                        // Move back down
-                        if (lines_up > 0) {
-                            renderer.write_raw(std::format("\n\033[{}B", lines_up - 1));
-                        } else {
-                            renderer.write_raw("\n");
-                        }
-                        renderer.flush();
+                // ── Status ───────────────────────────────────────────────
+                [&](UiStatus&) {
+                    if (step_num == 0 && !has_text) {
+                        // Only show on first step, before any output
+                    }
+                    // Reset tool state for next round
+                    if (slots_printed) {
+                        slots.clear();
+                        slots_printed = false;
+                        ++step_num;
                     }
                 },
 
-                [&](UiStatus& s) {
-                    if (tool_count == 0 && !has_streamed_text) {
-                        renderer.stream_styled(s.message, styles::muted);
-                        renderer.newline();
-                    }
-                    // After tool round, show "Thinking..." again
-                    if (all_starts_done) {
-                        all_starts_done = false;
-                        pending_tools.clear();
-                        tool_count = 0;
-                    }
-                },
-
+                // ── Error ────────────────────────────────────────────────
                 [&](UiError& e) {
-                    renderer.stream_styled(
-                        "Error: " + e.error.formatted(), styles::error);
-                    renderer.newline();
+                    std::cout << "\n" << FG_RED << BOLD
+                              << "  Error: " << RST << FG_RED
+                              << e.error.message << RST << "\n" << std::flush;
                 },
 
+                // ── Done ─────────────────────────────────────────────────
                 [&](UiDone&) {
-                    if (has_streamed_text) renderer.newline();
+                    if (has_text) std::cout << "\n";
+                    std::cout << "\n" << std::flush;
                 }
+
             }, evt);
         };
 
         auto result = agent_.run_turn(line, std::move(ui_sink));
         if (!result) {
-            renderer.stream_styled(
-                "Error: " + result.error().formatted(), styles::error);
-            renderer.newline();
+            std::cout << "\n" << FG_RED << BOLD << "  Error: " << RST
+                      << FG_RED << result.error().message << RST << "\n" << std::flush;
         }
-
-        renderer.newline();
     }
 }
 
