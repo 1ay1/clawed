@@ -25,7 +25,6 @@ add_executable(clawed
     src/ssh/session.cpp
     src/executor/local.cpp
     src/executor/ssh.cpp
-    src/ide/ide_app.cpp
 )
 
 target_include_directories(clawed PRIVATE include)

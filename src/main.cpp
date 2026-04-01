@@ -8,7 +8,6 @@
 #include <clawed/ssh/session.hpp>
 #include <clawed/agent/loop.hpp>
 #include <clawed/tui/app.hpp>
-#include <clawed/ide/ide_app.hpp>
 
 #include <cstdlib>
 #include <filesystem>
@@ -26,7 +25,6 @@ void print_usage() {
         "\033[1;36mclawed\033[0m — fast C++ Claude agent\n\n"
         "Usage:\n"
         "  clawed                              Start interactive session\n"
-        "  clawed ide                          Terminal IDE with agent\n"
         "  clawed remote user@host [dir]       Work on a remote machine via SSH\n"
         "  clawed login                        Authenticate (browser or API key)\n"
         "  clawed logout                       Remove saved credentials\n"
@@ -247,21 +245,6 @@ int main(int argc, char* argv[]) {
         if (cmd == "logout")                   return clawed::auth::cmd_logout();
         if (cmd == "status")                   return clawed::auth::cmd_status();
         if (cmd == "-h" || cmd == "--help") { print_usage(); return 0; }
-
-        if (cmd == "ide") {
-            auto creds = ensure_auth();
-            auto executor = std::make_shared<clawed::AnyExecutor>(clawed::LocalExecutor{});
-            clawed::ApiClient client({.credentials = creds});
-            clawed::ToolRegistry registry(std::move(executor));
-            clawed::tools::register_all(registry);
-            clawed::AgentLoop::Config agent_config{
-                .model = get_model(),
-                .system_prompt = build_system_prompt(),
-            };
-            clawed::ide::IdeApp ide(client, registry, std::move(agent_config));
-            ide.run();
-            return 0;
-        }
 
         if (cmd == "remote") {
             if (args.size() < 2) {

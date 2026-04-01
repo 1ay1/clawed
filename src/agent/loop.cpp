@@ -220,7 +220,20 @@ auto AgentLoop::execute_tools(state::ToolExec& exec_state, UiSink& ui)
 
         // Tell the UI what we're about to do
         auto summary = summarize_input(call.name, input);
-        ui(UiToolRunning{call.name, call.id, summary});
+
+        // For edit tool, build a diff detail
+        std::string detail;
+        if (call.name == "edit" && input.contains("old_string") && input.contains("new_string")) {
+            auto old_s = input["old_string"].get<std::string>();
+            auto new_s = input["new_string"].get<std::string>();
+            if (old_s.size() > 200) old_s = old_s.substr(0, 200) + "...";
+            if (new_s.size() > 200) new_s = new_s.substr(0, 200) + "...";
+            detail = "- " + old_s + "\n+ " + new_s;
+        } else if (call.name == "bash" && input.contains("command")) {
+            detail = input["command"].get<std::string>();
+        }
+
+        ui(UiToolRunning{call.name, call.id, summary, detail});
 
         // Execute with timing
         auto t0 = std::chrono::steady_clock::now();

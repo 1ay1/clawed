@@ -14,7 +14,13 @@ namespace clawed {
 
 struct UiTokens      { std::string text; };
 struct UiToolQueued  { std::string name; std::string id; };
-struct UiToolRunning { std::string name; std::string id; std::string summary; };
+struct UiToolRunning {
+    std::string name;
+    std::string id;
+    std::string summary;
+    // For edit tool: carries old/new text for diff display
+    std::string detail;
+};
 struct UiToolEnd     { std::string id; std::string result; bool is_error; int duration_ms; };
 struct UiStatus      { std::string message; };
 struct UiError       { Error error; };
